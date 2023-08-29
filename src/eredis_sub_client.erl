@@ -14,7 +14,7 @@
 
 
 %% API
--export([start_link/6, stop/1]).
+-export([start_link/7, stop/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -27,12 +27,13 @@
 -spec start_link(Host::list(),
                  Port::integer(),
                  Password::string(),
+                 Database::integer(),
                  ReconnectSleep::reconnect_sleep(),
                  MaxQueueSize::integer() | infinity,
                  QueueBehaviour::drop | exit) ->
                         {ok, Pid::pid()} | {error, Reason::term()}.
-start_link(Host, Port, Password, ReconnectSleep, MaxQueueSize, QueueBehaviour) ->
-    Args = [Host, Port, Password, ReconnectSleep, MaxQueueSize, QueueBehaviour],
+start_link(Host, Port, Password, Database, ReconnectSleep, MaxQueueSize, QueueBehaviour) ->
+    Args = [Host, Port, Password, Database, ReconnectSleep, MaxQueueSize, QueueBehaviour],
     gen_server:start_link(?MODULE, Args, []).
 
 
@@ -43,7 +44,11 @@ stop(Pid) ->
 %% gen_server callbacks
 %%====================================================================
 
-init([Host, Port, Password, ReconnectSleep, MaxQueueSize, QueueBehaviour]) ->
+init([Host, Port, Password, Database, ReconnectSleep, MaxQueueSize, QueueBehaviour]) ->
+    Sentinel = case Host of
+        "sentinel:"++MasterStr -> list_to_atom(MasterStr);
+         _ -> undefined
+    end,
     State = #state{host            = Host,
                    port            = Port,
                    password        = list_to_binary(Password),
@@ -52,7 +57,9 @@ init([Host, Port, Password, ReconnectSleep, MaxQueueSize, QueueBehaviour]) ->
                    parser_state    = eredis_parser:init(),
                    msg_queue       = queue:new(),
                    max_queue_size  = MaxQueueSize,
-                   queue_behaviour = QueueBehaviour},
+                   queue_behaviour = QueueBehaviour,
+                   sentinel        = Sentinel,
+                   database        = read_database(Database)},
 
     case connect(State) of
         {ok, NewState} ->
@@ -180,8 +187,8 @@ handle_info({tcp_closed, _Socket}, State) ->
     spawn(fun() -> reconnect_loop(Self, State) end),
 
     %% Throw away the socket. The absence of a socket is used to
-    %% signal we are "down"; discard possibly patrially parsed data
-    {noreply, State#state{socket = undefined, parser_state = eredis_parser:init()}};
+    %% signal we are "down"
+    {noreply, State#state{socket = undefined}};
 
 %% Controller might want to be notified about every reconnect attempt
 handle_info(reconnect_attempt, State) ->
@@ -201,6 +208,8 @@ handle_info({connection_ready, Socket}, #state{socket = undefined} = State) ->
     ok = inet:setopts(Socket, [{active, once}]),
     {noreply, State#state{socket = Socket}};
 
+handle_info({sentinel, {reconnect, _MasterName, Host, Port}}, State) ->
+    do_sentinel_reconnect(Host, Port, State);
 
 %% Our controlling process is down.
 handle_info({'DOWN', Ref, process, Pid, _Reason},
@@ -306,15 +315,33 @@ queue_or_send(Msg, State) ->
     end.
 
 
+connect(#state{sentinel = undefined} = State) ->
+    connect1(State);
+connect(#state{sentinel = Master} = State) ->
+    case eredis_sentinel:get_master(Master, true) of
+        {ok, {Host, Port}} ->
+            connect1(State#state{host=Host, port=Port});
+        {error, Error} ->
+            {error, {sentinel_error, Error}}
+    end.
+
+
 %% @doc: Helper for connecting to Redis. These commands are
 %% synchronous and if Redis returns something we don't expect, we
 %% crash. Returns {ok, State} or {error, Reason}.
-connect(State) ->
-    case gen_tcp:connect(State#state.host, State#state.port, [?SOCKET_MODE | ?SOCKET_OPTS]) of
+connect1(State) ->
+    {ok, {AFamily, Addr}} = get_addr(State#state.host),
+    case gen_tcp:connect(Addr, State#state.port,
+                         [AFamily | ?SOCKET_OPTS], State#state.connect_timeout) of
         {ok, Socket} ->
             case authenticate(Socket, State#state.password) of
                 ok ->
-                    {ok, State#state{socket = Socket}};
+                    case select_database(Socket, State#state.database) of
+                        ok ->
+                            {ok, State#state{socket = Socket}};
+                        {error, Reason} ->
+                            {error, {select_error, Reason}}
+                    end;
                 {error, Reason} ->
                     {error, {authentication_error, Reason}}
             end;
@@ -328,6 +355,13 @@ authenticate(_Socket, <<>>) ->
 authenticate(Socket, Password) ->
     eredis_client:do_sync_command(Socket, ["AUTH", " \"", Password, "\"\r\n"]).
 
+
+select_database(_Socket, undefined) ->
+    ok;
+select_database(_Socket, <<"0">>) ->
+    ok;
+select_database(Socket, Database) ->
+    eredis_client:do_sync_command(Socket, ["SELECT", " ", Database, "\r\n"]).
 
 %% @doc: Loop until a connection can be established, this includes
 %% successfully issuing the auth and select calls. When we have a
@@ -354,4 +388,55 @@ reconnect_loop(Client, #state{reconnect_sleep=ReconnectSleep}=State) ->
 send_to_controller(_Msg, #state{controlling_process=undefined}) ->
     ok;
 send_to_controller(Msg, #state{controlling_process={_Ref, Pid}}) ->
+    %%error_logger:info_msg("~p ! ~p~n", [Pid, Msg]),
     Pid ! Msg.
+
+%% Handle sentinel "reconnect to new master" message
+%% 1. we already connected to new master - ignore
+do_sentinel_reconnect(Host, Port, #state{host=Host,port=Port}=State) ->
+    {noreply, State};
+%% 2. we are waiting for reconnecting already - ignore
+do_sentinel_reconnect(_Host, _Port, #state{socket=undefined}=State) ->
+    {noreply, State};
+%% 3. we are not supposed to reconnect - stop processing
+do_sentinel_reconnect(_Host, _Port, #state{reconnect_sleep=no_reconnect}=State) ->
+    {stop, sentinel_reconnect, State};
+%% 4. we are connected to wrong master - reconnect
+do_sentinel_reconnect(Host, Port, State) ->
+    {ok, StateNew} = start_reconnect(State#state{host=Host, port=Port}),
+    {noreply, StateNew}.
+
+%% @doc Start reconnecting loop, close old connection if present.
+-spec start_reconnect(#state{}) -> {ok, #state{}}.
+start_reconnect(#state{socket=undefined} = State) ->
+    Self = self(),
+    spawn(fun() -> reconnect_loop(Self, State) end),
+
+    %% Throw away the socket and the queue, as we will never get a
+    %% response to the requests sent on the old socket. The absence of
+    %% a socket is used to signal we are "down"
+    %% TODO shouldn't we need to send error reply to waiting clients?
+    {ok, State};
+start_reconnect(#state{socket=Socket} = State) ->
+    gen_tcp:close(Socket),
+    start_reconnect(State#state{socket=undefined}).
+
+get_addr(Hostname) ->
+    case inet:parse_address(Hostname) of
+        {ok, {_,_,_,_} = Addr} ->         {ok, {inet, Addr}};
+        {ok, {_,_,_,_,_,_,_,_} = Addr} -> {ok, {inet6, Addr}};
+        {error, einval} ->
+            case inet:getaddr(Hostname, inet6) of
+                 {error, _} ->
+                     case inet:getaddr(Hostname, inet) of
+                         {ok, Addr}-> {ok, {inet, Addr}};
+                         {error, _} = Res -> Res
+                     end;
+                 {ok, Addr} -> {ok, {inet6, Addr}}
+            end
+    end.
+
+read_database(undefined) ->
+    undefined;
+read_database(Database) when is_integer(Database) ->
+    list_to_binary(integer_to_list(Database)).

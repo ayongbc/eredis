@@ -26,5 +26,8 @@
           % The msg_state keeps track of whether we are waiting
           % for the controlling process to acknowledge the last
           % message.
-          msg_state = need_ack :: ready | need_ack
+          msg_state = need_ack :: ready | need_ack,
+          sentinel :: undefined | atom(),
+          connect_timeout = 30000 :: integer() | undefined,
+          database :: binary() | undefined
 }).
